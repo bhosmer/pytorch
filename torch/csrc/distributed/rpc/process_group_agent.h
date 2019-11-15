@@ -6,6 +6,7 @@
 #include <torch/csrc/distributed/rpc/python_rpc_handler.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 
+#include <atomic>
 #include <thread>
 
 namespace torch {
@@ -70,6 +71,23 @@ class ProcessGroupAgent : public RpcAgent {
     std::mutex mutex_;
   };
 
+  struct FutureInfo {
+    std::shared_ptr<FutureMessage> future_;
+    std::chrono::milliseconds startTime_;
+    int dstRank_;
+    std::chrono::milliseconds timeout_;
+    FutureInfo(
+        const std::shared_ptr<FutureMessage>& future,
+        const std::chrono::milliseconds& startTime,
+        int dstRank,
+        const std::chrono::milliseconds timeout)
+        : future_(future),
+          startTime_(startTime),
+          dstRank_(dstRank),
+          timeout_(timeout){};
+    FutureInfo(){};
+  };
+
   void collectNames();
   // put SendWork into a queue and notify the worker thread
   void enqueueSend(SendWork work);
@@ -77,6 +95,15 @@ class ProcessGroupAgent : public RpcAgent {
   void enqueueRecv(RecvWork work);
   // receiving messages
   void listenLoop();
+  // poll for timed out RPCs
+  void pollTimedOutRPCs();
+  // process timed out futures
+  const std::vector<FutureInfo> processTimedOutFutures();
+  // compute the remaining time for an RPC, given its absolute start time and
+  // its timeout.
+  const std::chrono::milliseconds getRPCRemainingTime(
+      const std::chrono::milliseconds& rpcStartTime,
+      const std::chrono::milliseconds& rpcTimeout);
 
   // Note [Termination Detection]
   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -105,6 +132,10 @@ class ProcessGroupAgent : public RpcAgent {
     return ++nextId_;
   }
 
+  // atomic bool indicating if join() has been called and background threads
+  // should shutdown.
+  std::atomic_bool shutdown_;
+
   std::shared_ptr<c10d::ProcessGroup> pg_;
   // worker name -> rank
   std::unordered_map<std::string, int> nameMap_;
@@ -121,6 +152,8 @@ class ProcessGroupAgent : public RpcAgent {
   // when using the same tag.
   std::vector<std::mutex> sendMutexes_;
   std::thread listenerThread_;
+  // A thread to poll existing futures and check for timed out ones.
+  std::thread futureTimeoutThread_;
   // A threadPool that processing both SendWork and RecvWork. There are two
   // motivations for adding a ThreadPool:
   // (1) RPC serialization/deserialization and processing can be expensive,
@@ -133,10 +166,7 @@ class ProcessGroupAgent : public RpcAgent {
   ThreadPool threadPool_;
   // Mapping of request id to (future, future timeout) pair. We store the future
   // timeout for efficient lookups into the futureTimeouts_ map.
-  std::unordered_map<
-      int64_t,
-      std::pair<std::shared_ptr<FutureMessage>, std::chrono::milliseconds>>
-      futures_;
+  std::unordered_map<int64_t, FutureInfo> futures_;
   // A map to keep track of when futures time out. The map is keyed by the time
   // (millisecond level precision) the future started, and the values correspond
   // to a vector of futures that started at that time. When futures time out,
@@ -145,6 +175,8 @@ class ProcessGroupAgent : public RpcAgent {
   std::map<std::chrono::milliseconds, std::vector<int64_t>> futureTimeouts_;
   mutable std::mutex futureMutex_;
   mutable std::condition_variable futureCV_;
+  // CV to wake up watchdog thread that watches for timed out futures.
+  std::condition_variable futureTimeoutCV_;
 };
 
 } // namespace rpc

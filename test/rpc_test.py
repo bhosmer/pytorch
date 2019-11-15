@@ -117,6 +117,10 @@ def my_function(a, b, c):
 def my_tensor_function(a, b):
     return a + b
 
+def my_sleep_func():
+    import time
+    time.sleep(1)
+
 
 def my_complex_tensor_function(list_input, tensor_class_input, dict_input):
     res = list_input[0]
@@ -1062,10 +1066,6 @@ class RpcTest(object):
 
         self.assertEqual(result, sum(vals))
 
-    @dist_init
-    def test_get_default_rpc_timeout(self):
-        timeout = rpc.get_rpc_timeout()
-        self.assertEqual(timeout, rpc.constants.DEFAULT_RPC_TIMEOUT)
 
     @dist_init(setup_model_parallel=False)
     def test_set_rpc_timeout(self):
@@ -1082,6 +1082,27 @@ class RpcTest(object):
         self.assertEqual(timeout, set_timeout)
         rpc.join_rpc()
 
+    @dist_init
+    @requires_process_group_agent("PROCESS_GROUP rpc backend specific test, skip")
+    def test_rpc_timeouts(self):
+        rpc.set_rpc_timeout(timedelta(milliseconds=1))
+        dst_rank = (self.rank + 1) % self.world_size
+
+        futs = [rpc.rpc_async("worker{}".format(dst_rank), my_sleep_func, args=()) for _ in range(10)]
+        for fut in futs:
+            with self.assertRaisesRegex(RuntimeError, "RPC ran for more than"):
+                fut.wait()
+
+        # future should run to completion if the timeout is longer.
+        rpc.set_rpc_timeout(timedelta(seconds=500))
+        rpc.rpc_async("worker{}".format(dst_rank), my_sleep_func, args=()).wait()
+
+        # future should run to completion if the timeout is zero.
+        rpc.set_rpc_timeout(timedelta(seconds=0))
+        rpc.rpc_async("worker{}".format(dst_rank), my_sleep_func, args=()).wait()
+
+        # reset to default timeout so shutdown messages can process cleanly.
+        rpc.set_rpc_timeout(rpc.constants.DEFAULT_RPC_TIMEOUT)
 
     def test_requires_process_group_agent_decorator(self):
         @requires_process_group_agent("test_func did not run")
